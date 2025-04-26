@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# VS Code / IDE config
+.vscode/
+.idea/
+*.code-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary data
+*.log
+data/
+*.json
+
+# Executables
+*.exe
+
+# Databases and crawled data
+chroma_db/
+
+# Playwright/Selenium downloads
+playwright/
+downloads/
+
+# Environment variables
+.env

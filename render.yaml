@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: learnlink-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt && playwright install
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port 10000
+    envVars:
+    - key: DEEPSEEK_API_KEY
+      fromEnv: DEEPSEEK_API_KEY
+
+
+cronJobs:
+  - name: daily-crawl
+    schedule: "0 2 * * *"  # Runs every day at 2 AM UTC
+    command: python crawler/playwright_crawler.py
