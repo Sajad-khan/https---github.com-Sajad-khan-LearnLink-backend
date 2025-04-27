@@ -29,7 +29,7 @@ ALLOWED_DOMAIN = "nitsri.ac.in"
 MAX_DEPTH = 3  # Increased depth
 DATA_PATH = "data/scraped_data.json"
 MAX_WORKERS = 3  # Number of parallel workers
-MAX_PAGES_PER_DOMAIN = 5000  # Increased page limit
+MAX_PAGES_PER_DOMAIN = 10000  # Increased page limit
 REQUEST_TIMEOUT = 15  # Seconds for requests
 PAGE_LOAD_TIMEOUT = 15  # Seconds for Selenium
 

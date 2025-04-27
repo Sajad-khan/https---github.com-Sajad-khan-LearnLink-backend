@@ -1,210 +1,251 @@
 import os
 import json
-import requests
+import logging
+from typing import List, Dict, Any
 import chromadb
+from chromadb.config import Settings
+from openai import OpenAI
 from dotenv import load_dotenv
+import time
+from tqdm import tqdm
+import colorama
+from termcolor import colored
+import tiktoken  # For accurate token counting
 
+# Initialize colorama
+colorama.init()
+
+# Load environment variables
 load_dotenv()
 
-# Updated ChromaDB path for Windows
-CHROMA_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
-OPENAI_API_KEY = os.getenv("OPEN_AI_API_KEY")  # Note: Getting from OPEN_AI_API_KEY as specified
-SCRAPED_FILE = "../crawler/data/scraped_data.json"
-MAX_CHUNK_SIZE = 8000  # Max tokens for OpenAI embeddings (text-embedding-3-small supports up to 8K tokens)
-CHUNK_OVERLAP = 200    # Overlap between chunks to maintain context
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format=colored('%(asctime)s', 'cyan') + ' - ' + 
+           colored('%(levelname)s', 'green') + ' - ' + 
+           colored('%(message)s', 'white')
+)
+logger = logging.getLogger(__name__)
 
-# Validate API key
-if not OPENAI_API_KEY:
-    raise ValueError("OPEN_AI_API_KEY not found in environment variables")
-
-# Initialize ChromaDB client
-client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-
-# Get or create collection
-collection = client.get_or_create_collection("nitsri")
-
-def chunk_text(text, max_size=MAX_CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into chunks of max_size with overlap."""
-    words = text.split()
-    
-    # If text is small enough, return as single chunk
-    if len(words) <= max_size:
-        return [text]
-    
-    chunks = []
-    start_idx = 0
-    
-    while start_idx < len(words):
-        # Calculate end index for this chunk
-        end_idx = min(start_idx + max_size, len(words))
+class EmbeddingService:
+    def __init__(self, collection_name='nit_knowledge'):
+        # Start timing the initialization
+        start_time = time.time()
         
-        # Create chunk from words
-        chunk = " ".join(words[start_idx:end_idx])
-        chunks.append(chunk)
+        # Determine the absolute path of the script
+        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         
-        # Move start index forward, accounting for overlap
-        start_idx = end_idx - overlap if end_idx < len(words) else end_idx
-    
-    return chunks
-
-def get_embedding(text):
-    """Get embedding for text using OpenAI API."""
-    url = "https://api.openai.com/v1/embeddings"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "text-embedding-3-small",  # Most cost-effective embedding model
-        "input": text
-    }
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()  # Raise exception for HTTP errors
-        result = response.json()
+        # Initialize tokenizer
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
         
-        if "data" in result and result["data"]:
-            return result["data"][0]["embedding"]
-        else:
-            print(f"❌ Failed to embed: {result}")
-            return None
-    except requests.exceptions.RequestException as e:
-        print(f"❌ API request failed: {e}")
-        return None
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        return None
-
-def process_data():
-    """Process scraped data, chunk it, and store in ChromaDB."""
-    # Track stats
-    processed_docs = 0
-    processed_chunks = 0
-    skipped = 0
-    failed = 0
-    
-    try:
-        # Update path to be Windows-compatible and check if file exists
-        adjusted_path = os.path.normpath(os.path.join(os.path.dirname(__file__), SCRAPED_FILE))
-        if not os.path.exists(adjusted_path):
-            print(f"❌ File not found: {adjusted_path}")
-            return
+        logger.info(colored("🚀 Initializing Embedding Service", "blue"))
+        logger.info(colored(f"📍 Base Directory: {self.BASE_DIR}", "cyan"))
+        
+        # Initialize ChromaDB client
+        try:
+            db_path = os.path.join(self.BASE_DIR, "chroma_db")
+            logger.info(colored(f"📂 ChromaDB Path: {db_path}", "cyan"))
             
-        print(f"📂 Processing file: {adjusted_path}")
+            # Ensure chroma_db directory exists
+            os.makedirs(db_path, exist_ok=True)
+            
+            self.chroma_client = chromadb.PersistentClient(path=db_path)
+            logger.info(colored("✅ ChromaDB Client Initialized", "green"))
+        except Exception as e:
+            logger.error(colored(f"❌ ChromaDB Initialization Failed: {e}", "red"))
+            raise
         
-        with open(adjusted_path, "r", encoding="utf-8") as f:
-            # Get existing IDs to avoid duplicates
-            try:
-                existing_ids = set(collection.get()["ids"]) if collection.count() > 0 else set()
-                print(f"📊 Found {len(existing_ids)} existing documents in the collection")
-            except Exception as e:
-                print(f"⚠️ Could not retrieve existing IDs: {e}")
-                existing_ids = set()
-            
-            # Count total lines for progress reporting
-            total_lines = sum(1 for _ in open(adjusted_path, "r", encoding="utf-8"))
-            print(f"📄 Total documents to process: {total_lines}")
-            
-            for idx, line in enumerate(f):
-                doc_base_id = f"doc_{idx}"
+        # Initialize OpenAI client
+        try:
+            api_key = os.getenv('OPEN_AI_API_KEY')
+            if not api_key:
+                logger.error(colored("❌ OpenAI API key not found in environment variables", "red"))
+                raise ValueError("OpenAI API key not found")
                 
-                # Print progress every 10 documents
-                if idx % 10 == 0:
-                    print(f"⏳ Processing document {idx+1}/{total_lines}...")
+            self.openai_client = OpenAI(api_key=api_key)
+            logger.info(colored("✅ OpenAI Client Initialized", "green"))
+        except Exception as e:
+            logger.error(colored(f"❌ OpenAI Client Initialization Failed: {e}", "red"))
+            raise
+        
+        # Create or get collection
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        
+        # Log collection count
+        doc_count = self.collection.count()
+        logger.info(colored(f"📂 Collection '{collection_name}' Ready with {doc_count} documents", "magenta"))
+        
+        # Log initialization time
+        init_time = time.time() - start_time
+        logger.info(colored(f"⏱️  Initialization completed in {init_time:.2f} seconds", "yellow"))
+
+    def chunk_text(self, text: str, max_tokens: int = 3000, overlap: int = 500) -> List[str]:
+        """
+        Chunk text based on token count with overlap.
+        Chunks will be at most 3000 tokens with 500 token overlap by default.
+        """
+        if not text or text.strip() == "":
+            logger.warning(colored("⚠️ Empty text provided for chunking", "yellow"))
+            return []
+            
+        # Tokenize the entire text
+        tokens = self.tokenizer.encode(text)
+        logger.info(colored(f"📏 Text length: {len(tokens)} tokens", "cyan"))
+        
+        chunks = []
+        start = 0
+        
+        while start < len(tokens):
+            # Select a chunk of tokens
+            chunk_tokens = tokens[start:start + max_tokens]
+            
+            # Decode the chunk
+            chunk = self.tokenizer.decode(chunk_tokens)
+            chunks.append(chunk)
+            
+            # Move start position with overlap
+            start += max_tokens - overlap
+        
+        logger.info(colored(f"✂️  Created {len(chunks)} chunks (max {max_tokens} tokens)", "green"))
+        return chunks
+
+    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings for given texts using OpenAI
+        """
+        if not texts:
+            logger.warning(colored("⚠️ No texts provided for embedding generation", "yellow"))
+            return []
+            
+        try:
+            embeddings = []
+            for text in tqdm(texts, desc=colored("Generating Embeddings", "blue")):
+                response = self.openai_client.embeddings.create(
+                    model="text-embedding-ada-002",
+                    input=[text]
+                )
+                embeddings.append(response.data[0].embedding)
+            
+            logger.info(colored(f"✅ Generated {len(embeddings)} embeddings", "green"))
+            return embeddings
+        
+        except Exception as e:
+            logger.error(colored(f"❌ Embedding Generation Error: {e}", "red"))
+            raise
+
+    def embed_scraped_data(self, relative_path: str):
+        """
+        Embed scraped web data by chunking large files
+        """
+        start_time = time.time()
+        
+        # Construct absolute path
+        scraped_data_path = os.path.normpath(os.path.join(self.BASE_DIR, relative_path))
+        
+        logger.info(colored(f"🌐 Starting embedding of scraped data", "blue"))
+        logger.info(colored(f"📁 Scraped Data Path: {scraped_data_path}", "cyan"))
+
+        try:
+            # Validate file existence
+            if not os.path.exists(scraped_data_path):
+                logger.error(colored(f"❌ File not found: {scraped_data_path}", "red"))
+                raise FileNotFoundError(f"Scraped data file not found: {scraped_data_path}")
+
+            # Log file details
+            file_size = os.path.getsize(scraped_data_path)
+            logger.info(colored(f"📊 File Size: {file_size / 1024:.2f} KB", "magenta"))
+
+            # Read the entire file content
+            with open(scraped_data_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
                 
-                try:
-                    item = json.loads(line)
-                    content = item.get("content", "").strip()
-                    url = item.get("url", "")
-                    
-                    # Skip if content is too short
-                    if len(content.split()) < 20:
-                        skipped += 1
-                        continue
-                    
-                    # Create chunks from content
-                    chunks = chunk_text(content)
-                    chunk_success = 0
-                    
-                    # Process each chunk
-                    for chunk_idx, chunk in enumerate(chunks):
-                        # Generate a unique ID for this chunk
-                        chunk_id = f"{doc_base_id}_chunk_{chunk_idx}"
+                # Check if the file is JSON
+                if scraped_data_path.lower().endswith('.json'):
+                    try:
+                        # Parse JSON file
+                        json_data = json.loads(file_content)
                         
-                        # Skip if already processed
-                        if chunk_id in existing_ids:
-                            skipped += 1
-                            continue
-                        
-                        # Get embedding for chunk
-                        embedding = get_embedding(chunk)
-                        if not embedding:
-                            failed += 1
-                            continue
-                        
-                        # Add to ChromaDB with the embedding
-                        collection.add(
-                            documents=[chunk],
-                            embeddings=[embedding],
-                            metadatas=[{
-                                "url": url,
-                                "doc_id": doc_base_id,
-                                "chunk_idx": chunk_idx,
-                                "total_chunks": len(chunks)
-                            }],
-                            ids=[chunk_id]
-                        )
-                        
-                        chunk_success += 1
-                        processed_chunks += 1
-                    
-                    if chunk_success > 0:
-                        processed_docs += 1
-                        print(f"✅ Embedded doc_{idx}: {url} ({chunk_success}/{len(chunks)} chunks)")
-                    else:
-                        print(f"❌ Failed to embed any chunks for doc_{idx}: {url}")
-                        
-                except json.JSONDecodeError:
-                    print(f"❌ Invalid JSON at line {idx+1}")
-                    failed += 1
-                except Exception as e:
-                    print(f"❌ Failed to process line {idx+1}: {e}")
-                    failed += 1
-    except Exception as e:
-        print(f"❌ Error processing file: {e}")
-    
-    print(f"📊 Summary: {processed_docs} documents processed ({processed_chunks} chunks), {skipped} skipped, {failed} failed")
+                        # Handle different JSON structures
+                        if isinstance(json_data, list):
+                            # JSON array - process each item
+                            logger.info(colored(f"📊 JSON array with {len(json_data)} items", "cyan")) 
+                            combined_text = ""
+                            for item in json_data:
+                                if isinstance(item, dict):
+                                    # Convert dict values to string and join
+                                    item_text = " ".join(str(v) for v in item.values() if v)
+                                    combined_text += item_text + "\n\n"
+                                else:
+                                    # Just convert to string
+                                    combined_text += str(item) + "\n\n"
+                            file_content = combined_text
+                        elif isinstance(json_data, dict):
+                            # Single JSON object - extract values
+                            logger.info(colored("📊 Single JSON object", "cyan"))
+                            file_content = " ".join(str(v) for v in json_data.values() if v)
+                    except json.JSONDecodeError:
+                        # Not valid JSON, continue with raw content
+                        logger.warning(colored("⚠️ File has .json extension but content is not valid JSON", "yellow"))
+                        pass
 
-def query_similar(query_text, n_results=5):
-    """Query for similar documents based on a text query."""
-    # Get embedding for query
-    query_embedding = get_embedding(query_text)
-    if not query_embedding:
-        print("❌ Failed to get embedding for query")
-        return []
-    
-    # Query the collection
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"]
-    )
-    
-    return results
+            # Chunk the content (now max 3000 tokens per chunk)
+            content_chunks = self.chunk_text(file_content)
+            logger.info(colored(f"📦 Created {len(content_chunks)} chunks", "cyan"))
+            
+            if not content_chunks:
+                logger.warning(colored("⚠️ No chunks were created. File might be empty.", "yellow"))
+                return
 
+            # Generate embeddings for chunks
+            embeddings = self.generate_embeddings(content_chunks)
+            
+            if not embeddings:
+                logger.warning(colored("⚠️ No embeddings were generated.", "yellow"))
+                return
+
+            # Add chunks to ChromaDB
+            for idx, (chunk, embedding) in enumerate(zip(content_chunks, embeddings)):
+                # Calculate token count for logging
+                token_count = len(self.tokenizer.encode(chunk))
+                
+                metadata = {
+                    'source': 'scraped',
+                    'original_source': os.path.basename(scraped_data_path),
+                    'chunk_number': idx,
+                    'token_count': token_count
+                }
+
+                self.collection.add(
+                    embeddings=[embedding],
+                    documents=[chunk],
+                    ids=[f"scraped_{os.path.basename(scraped_data_path)}_{idx}"],
+                    metadatas=[metadata]
+                )
+                logger.info(colored(f"✅ Added chunk {idx+1}/{len(content_chunks)} to ChromaDB", "green"))
+
+            # Get updated document count
+            doc_count = self.collection.count()
+            
+            # Compute and log processing time
+            processing_time = time.time() - start_time
+            logger.info(colored(f"✅ Successfully embedded {len(content_chunks)} chunks", "green"))
+            logger.info(colored(f"📊 Collection now has {doc_count} total documents", "magenta"))
+            logger.info(colored(f"⏱️  Total processing time: {processing_time:.2f} seconds", "yellow"))
+
+        except Exception as e:
+            logger.error(colored(f"❌ Embedding Process Failed: {e}", "red"))
+            raise
+
+# Executable script section
 if __name__ == "__main__":
-    process_data()
-    
-    # Uncomment to test querying
-    # test_query = "What is NITSRI?"
-    # results = query_similar(test_query)
-    # print(f"Query results for '{test_query}':")
-    # for i, (doc, metadata, distance) in enumerate(zip(
-    #     results["documents"][0], 
-    #     results["metadatas"][0],
-    #     results["distances"][0]
-    # )):
-    #     print(f"\n--- Result {i+1} (Distance: {distance:.4f}) ---")
-    #     print(f"URL: {metadata['url']}")
-    #     print(f"Document ID: {metadata['doc_id']}, Chunk {metadata['chunk_idx']+1}/{metadata['total_chunks']}")
-    #     print(f"Preview: {doc[:200]}...")
+    try:
+        # Use relative path to scraped data
+        SCRAPED_FILE = "../crawler/data/scraped_data.json"
+        
+        embedding_service = EmbeddingService()
+        embedding_service.embed_scraped_data(SCRAPED_FILE)
+    except Exception as e:
+        logger.error(colored(f"Fatal Error: {e}", "red"))
